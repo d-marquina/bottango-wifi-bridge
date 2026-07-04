@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Animatrónico</title>
+<style>
+  :root {
+    --bg: #0f1220; --panel: #1a1f35; --panel2: #222944;
+    --text: #e8eaf6; --dim: #8a93b8;
+    --accent: #29d398; --accent2: #1fa87a; --danger: #ff5d73;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    padding: 24px 16px;
+  }
+  header { text-align: center; margin-bottom: 20px; }
+  h1 { font-size: 1.5rem; font-weight: 600; letter-spacing: .5px; }
+  .sub { color: var(--dim); font-size: .85rem; margin-top: 4px; }
+  .status {
+    display: inline-flex; align-items: center; gap: 8px;
+    margin-top: 8px; color: var(--dim); font-size: .9rem;
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); }
+  .dot.on { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+
+  .card {
+    background: var(--panel); border-radius: 16px; padding: 20px;
+    width: 100%; max-width: 480px; margin-bottom: 16px;
+    box-shadow: 0 4px 24px rgba(0,0,0,.35);
+  }
+  .anim-row {
+    display: flex; align-items: center; justify-content: space-between;
+    background: var(--panel2); border-radius: 12px; padding: 12px 14px;
+    margin-bottom: 10px; gap: 8px;
+  }
+  .anim-row:last-child { margin-bottom: 0; }
+  .anim-info { flex: 1; min-width: 0; }
+  .anim-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .anim-time { color: var(--dim); font-size: .85rem; margin-top: 2px; }
+  .anim-actions { display: flex; gap: 6px; }
+  .empty { color: var(--dim); text-align: center; padding: 12px 0; }
+
+  button {
+    border: 0; border-radius: 12px; cursor: pointer;
+    font-size: 1rem; font-weight: 700; color: #08130e;
+    padding: 12px 16px; transition: transform .06s ease, opacity .2s;
+  }
+  button:active { transform: scale(.96); }
+  button:disabled { opacity: .35; cursor: default; }
+  .play { background: var(--accent); }
+  .icon {
+    background: transparent; color: var(--dim); padding: 10px 8px;
+    font-size: .95rem;
+  }
+  .icon:active { color: var(--text); }
+  .stop { background: var(--danger); color: #2a0a10; width: 100%; margin-top: 12px; }
+  .upload {
+    background: var(--panel2); color: var(--text); width: 100%;
+    border: 1px dashed var(--dim); font-weight: 600;
+  }
+
+  #log {
+    width: 100%; max-width: 480px; height: 170px; overflow-y: auto;
+    background: #0a0d18; border-radius: 12px; padding: 12px;
+    font-family: ui-monospace, Consolas, monospace; font-size: .72rem;
+    color: #7ee0b8; line-height: 1.5;
+  }
+  #log .err { color: var(--danger); }
+</style>
+</head>
+<body>
+  <header>
+    <h1>🤖 Animatrónico</h1>
+    <div class="sub" id="controller"></div>
+    <div class="status"><span id="dot" class="dot"></span><span id="stateTxt">Conectando…</span></div>
+  </header>
+
+  <div class="card">
+    <div id="animList"><div class="empty">Sin proyecto — sube el JSON exportado de Bottango</div></div>
+    <button id="btnStop" class="stop" disabled>■ Detener</button>
+  </div>
+
+  <div class="card">
+    <input type="file" id="filePick" accept=".json" style="display:none">
+    <button id="btnUpload" class="upload">⬆ Subir proyecto (JSON)</button>
+  </div>
+
+  <div id="log"></div>
+
+<script>
+  // Plain ES5-ish JavaScript on purpose: the HMI must run on older Android
+  // tablets (Chrome on Android 5–7), so no optional chaining / fetch extras.
+  var ws = null;
+  var anims = [];
+  var uiState = 'idle';
+  var dot = document.getElementById('dot');
+  var stateTxt = document.getElementById('stateTxt');
+  var controllerEl = document.getElementById('controller');
+  var animList = document.getElementById('animList');
+  var btnStop = document.getElementById('btnStop');
+  var btnUpload = document.getElementById('btnUpload');
+  var filePick = document.getElementById('filePick');
+  var logEl = document.getElementById('log');
+
+  function logLine(msg, isErr) {
+    var div = document.createElement('div');
+    if (isErr) div.className = 'err';
+    div.textContent = msg;
+    logEl.appendChild(div);
+    while (logEl.childNodes.length > 200) logEl.removeChild(logEl.firstChild);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function renderAnims() {
+    animList.innerHTML = '';
+    if (!anims.length) {
+      animList.innerHTML = '<div class="empty">Sin proyecto — sube el JSON exportado de Bottango</div>';
+      return;
+    }
+    for (var i = 0; i < anims.length; i++) {
+      // Closure captures the index for the row's button handlers.
+      (function (idx) {
+        var row = document.createElement('div');
+        row.className = 'anim-row';
+
+        var info = document.createElement('div');
+        info.className = 'anim-info';
+        info.innerHTML = '<div class="anim-name"></div><div class="anim-time"></div>';
+        info.querySelector('.anim-name').textContent = anims[idx].name;
+        info.querySelector('.anim-time').textContent = (anims[idx].ms / 1000).toFixed(1) + ' s';
+
+        var actions = document.createElement('div');
+        actions.className = 'anim-actions';
+
+        var btnRen = document.createElement('button');
+        btnRen.className = 'icon';
+        btnRen.textContent = '✏️';
+        btnRen.title = 'Renombrar';
+        btnRen.onclick = function () {
+          var name = prompt('Nuevo nombre:', anims[idx].name);
+          if (name && name.replace(/\s/g, '').length) ws.send('ren:' + idx + ':' + name.trim());
+        };
+
+        var btnDel = document.createElement('button');
+        btnDel.className = 'icon';
+        btnDel.textContent = '🗑️';
+        btnDel.title = 'Borrar';
+        btnDel.onclick = function () {
+          if (confirm('¿Borrar "' + anims[idx].name + '"?')) ws.send('del:' + idx);
+        };
+
+        var btnPlay = document.createElement('button');
+        btnPlay.className = 'play';
+        btnPlay.textContent = '▶';
+        btnPlay.disabled = (uiState === 'playing');
+        btnPlay.onclick = function () { ws.send('play:' + idx); };
+
+        actions.appendChild(btnRen);
+        actions.appendChild(btnDel);
+        actions.appendChild(btnPlay);
+        row.appendChild(info);
+        row.appendChild(actions);
+        animList.appendChild(row);
+      })(i);
+    }
+  }
+
+  function setUiState(state) {
+    uiState = state;
+    if (state === 'playing') {
+      stateTxt.textContent = 'Reproduciendo…';
+      btnStop.disabled = false;
+    } else {
+      stateTxt.textContent = 'Listo';
+      btnStop.disabled = true;
+    }
+    renderAnims();
+  }
+
+  function connect() {
+    ws = new WebSocket('ws://' + location.host + '/ws');
+
+    ws.onopen = function () {
+      dot.className = 'dot on';
+      logLine('[HMI] conectado al puente');
+    };
+
+    ws.onmessage = function (ev) {
+      var m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.type === 'state') setUiState(m.state);
+      else if (m.type === 'log') logLine(m.msg, m.msg.indexOf('ERROR') === 0);
+      else if (m.type === 'anims') {
+        anims = m.list;
+        controllerEl.textContent = m.controller || '';
+        renderAnims();
+      }
+    };
+
+    ws.onclose = function () {
+      // Auto-reconnect: the ESP32 may reboot or WiFi may blip.
+      dot.className = 'dot';
+      stateTxt.textContent = 'Reconectando…';
+      btnStop.disabled = true;
+      setTimeout(connect, 1500);
+    };
+  }
+
+  btnStop.onclick = function () { ws.send('stop'); };
+  btnUpload.onclick = function () { filePick.click(); };
+
+  filePick.onchange = function () {
+    if (!filePick.files.length) return;
+    var fd = new FormData();
+    fd.append('file', filePick.files[0]);
+    btnUpload.disabled = true;
+    btnUpload.textContent = 'Subiendo…';
+    // XMLHttpRequest (not fetch) for maximum compatibility with old WebViews.
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/upload');
+    xhr.onload = function () {
+      btnUpload.disabled = false;
+      btnUpload.textContent = '⬆ Subir proyecto (JSON)';
+      logLine(xhr.status === 200 ? '[HMI] proyecto subido' : '[HMI] ERROR al subir', xhr.status !== 200);
+      filePick.value = '';
+    };
+    xhr.onerror = xhr.onload;
+    xhr.send(fd);
+  };
+
+  connect();
+</script>
+</body>
+</html>
