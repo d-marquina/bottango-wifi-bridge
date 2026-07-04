@@ -282,7 +282,7 @@ static void stopPlayback() {
   wsLog(">> xC");
   picoSerial.print("xC\n");   // clears curves WITHOUT resetting the Pico
   wsState("idle");
-  wsLog("Detenido (xC)");
+  wsLog("Stopped (xC)");
 }
 
 static void abortPlayback(const String &reason) {
@@ -303,7 +303,7 @@ static void advanceSequence() {
   setupDone = true;
   playerState = PLAYING;
   playEndsAt = millis() + pendingDurationMs;
-  wsLog("Curvas encoladas; la Pico reproduce sola");
+  wsLog("Curves queued; the Pico plays on its own clock");
 }
 
 static void handlePicoLine(const String &line) {
@@ -332,13 +332,13 @@ static void pollPicoSerial() {
 
 static void pollPlayer() {
   if (waitingReply && millis() > replyDeadline) {
-    abortPlayback("timeout esperando \"" + expectedPrefix + "\"");
+    abortPlayback("timeout waiting for \"" + expectedPrefix + "\"");
     return;
   }
   if (playerState == PLAYING && millis() > playEndsAt) {
     playerState = IDLE;
     wsState("idle");
-    wsLog("Animación terminada");
+    wsLog("Animation finished");
   }
 }
 
@@ -349,21 +349,21 @@ static void renameAnimation(size_t idx, const String &newName) {
   animations[idx].name = newName;
   if (saveProject()) {
     ws.textAll(buildAnimListJson());
-    wsLog("Renombrada → " + newName);
+    wsLog("Renamed to: " + newName);
   }
 }
 
 static void deleteAnimation(size_t idx) {
   if (idx >= animations.size()) return;
   if (playerState != IDLE) {
-    wsLog("ERROR: detén la reproducción antes de borrar");
+    wsLog("ERROR: stop playback before deleting");
     return;
   }
   String gone = animations[idx].name;
   animations.erase(animations.begin() + idx);
   if (saveProject()) {
     ws.textAll(buildAnimListJson());
-    wsLog("Borrada: " + gone);
+    wsLog("Deleted: " + gone);
   }
 }
 
@@ -413,8 +413,8 @@ static void handleUploadChunk(AsyncWebServerRequest *req, String filename,
     if (loadProject()) {
       setupDone = false;          // effectors may have changed → re-register
       ws.textAll(buildAnimListJson());
-      wsLog("Proyecto actualizado: " + controllerName + " (" +
-            String(animations.size()) + " animaciones)");
+      wsLog("Project updated: " + controllerName + " (" +
+            String(animations.size()) + " animations)");
     }
   }
 }

@@ -31,6 +31,8 @@ Browser ──WiFi/WebSocket──► ESP32 ──UART2──► RPi Pico ──
   with per-command OK flow control. Stop uses `xC` (never `STOP`, which
   would reset the Pico).
 - **Live log panel** mirroring all serial traffic with the Pico.
+- **Bilingual UI (Spanish / English)** — toggle with the EN/ES button in the
+  header; the choice is remembered per device (localStorage).
 - **Legacy-browser friendly** — the HMI runs on Chrome for Android 5–7 era
   tablets (no modern-JS-only syntax, XHR uploads, auto-reconnect WebSocket).
 
@@ -51,7 +53,8 @@ connected unless your board has a protection diode.
 
 ### Pico side
 
-In the Pico's `main.py` (BottangoMPDriver), enable the bridge flag:
+In the Pico's `main.py` (BottangoMPDriver), enable the bridge flag — it is
+**`False` by default** (plain USB/Bottango behaviour):
 
 ```python
 ENABLE_UART_BRIDGE = True   # duplicates the console on UART0 (GP0/GP1)
