@@ -113,12 +113,18 @@ and stick it on the animatronic — scanning it joins the network directly.
 
 ## Limitations / roadmap
 
-- Playback uses "dump mode": all curves are queued up-front, valid for up to
-  8 curves per effector (the driver's buffer). Longer animations will need
-  streaming mode (planned).
 - `Animation Loop Commands`, idle animations and autoplay-on-boot are stored
   but not yet played (planned).
 - Only the first controller in the exported JSON is used.
+
+### Streaming playback
+
+Animations of any length are supported. The driver keeps a circular buffer of
+8 curves per effector, so instead of dumping everything up-front the bridge
+streams each curve line ~1 s before its start time, and additionally holds a
+line back until the buffer slot it would overwrite belongs to a curve that
+has already finished. Flow control (one command per OK) is honoured
+throughout.
 
 ## Related projects
 

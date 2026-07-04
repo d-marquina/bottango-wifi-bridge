@@ -14,9 +14,10 @@
  *     page; it is persisted in LittleFS (/project.json) — upload once.
  *   - Dynamic animation list (name + computed duration).
  *   - Rename / delete animations from the web page (changes are persisted).
- *   - "Mode A" playback by index: handshake + effector setup (once per
- *     session) + tSYN,0 + curves, honouring the driver's flow control
- *     (wait for OK after each command, exactly like Bottango does).
+ *   - STREAMING playback (no curve-count limit): curves are sent just
+ *     ahead of their start time instead of all up-front, respecting the
+ *     driver's 8-slot circular curve buffer per effector. Flow control is
+ *     honoured throughout (wait for OK after each command).
  *   - Stop via xC (STOP would trigger machine.reset() on the Pico).
  */
 
@@ -26,6 +27,8 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <vector>
+#include <map>
+#include <algorithm>
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -39,6 +42,16 @@ static const uint32_t UART_BAUD = 115200;
 
 static const char *PROJECT_FILE = "/project.json";
 static const uint32_t REPLY_TIMEOUT_MS = 3000;
+
+// Streaming: send each curve this many ms before its start time. Large
+// enough to survive WiFi/UART hiccups, small enough to keep few curves
+// in flight per effector.
+static const uint32_t STREAM_LOOKAHEAD_MS = 1000;
+
+// The driver's per-effector circular curve buffer size (MAX_NUM_CURVES in
+// abstract_effector.py). Sending curve N+1 overwrites the oldest of the
+// last N — only safe once that one has already finished playing.
+static const size_t DRIVER_CURVE_SLOTS = 8;
 
 HardwareSerial picoSerial(2);
 
@@ -55,23 +68,39 @@ static String controllerName;
 static String setupCommands;              // rSVI2C/rSVPin/... lines, '\n'-separated
 static std::vector<AnimEntry> animations;
 
-// ── Player (non-blocking state machine) ───────────────────────────────────────
+// ── Player state ──────────────────────────────────────────────────────────────
 
 struct QueuedCmd {
   String cmd;
   String expect;   // expected reply prefix ("OK" or "btngoHSK")
 };
 
-enum PlayerState { IDLE, SENDING, PLAYING };
+// One schedulable line of the animation (a full sC, or a whole sSY batch).
+struct StreamItem {
+  uint32_t startMs;   // when the earliest curve in the line starts
+  String line;        // raw protocol line to send
+};
+
+enum PlayerState { IDLE, SENDING, STREAMING };
 
 static PlayerState playerState = IDLE;
+
+// SENDING phase: handshake/setup/tSYN queue (strictly sequential).
 static std::vector<QueuedCmd> cmdQueue;
 static size_t qIndex = 0;
+
+// STREAMING phase: time-scheduled curve lines.
+static std::vector<StreamItem> streamItems;
+static size_t streamIdx = 0;
+static uint32_t animStartMs = 0;        // millis() when tSYN,0 was acknowledged
+static uint32_t animDurationMs = 0;
+// Per-effector ledger of END times of every curve already sent, in send
+// order. Used to respect the driver's 8-slot buffer (see canSendToEffector).
+static std::map<String, std::vector<uint32_t>> effectorLedger;
+
 static bool waitingReply = false;
 static String expectedPrefix;
 static uint32_t replyDeadline = 0;
-static uint32_t playEndsAt = 0;
-static uint32_t pendingDurationMs = 0;
 static bool setupDone = false;    // handshake + setup already sent this session
 
 static String uartLineBuffer;
@@ -117,21 +146,47 @@ static String buildAnimListJson() {
   return out;
 }
 
-// ── Duration computation ──────────────────────────────────────────────────────
-// Duration = max(startOffset + duration) across every curve of every line.
-// Supports both "sC,..." and the batched "sSY,sC,<e1>;<e2>;..." form.
+// ── Curve-line parsing ────────────────────────────────────────────────────────
+// sC entry fields (after the "sC," prefix): id,start,dur,startY,cp1x,cp1y,...
+// sSY batches several entries separated by ';' after the "sSY,sC," prefix.
 
-static void scanCurveFields(const String &entry, uint32_t &maxEnd) {
-  // entry = "id,start,dur,rest..." → we need fields 1 and 2
+// Extracts id / start / duration from one curve entry. Returns false if the
+// entry is malformed (e.g. the trailing hash fragment of an sSY batch).
+static bool parseCurveEntry(const String &entry, String &id,
+                            uint32_t &start, uint32_t &dur) {
   int c1 = entry.indexOf(',');
-  if (c1 < 0) return;
+  if (c1 <= 0) return false;
   int c2 = entry.indexOf(',', c1 + 1);
-  if (c2 < 0) return;
+  if (c2 < 0) return false;
   int c3 = entry.indexOf(',', c2 + 1);
-  long start = entry.substring(c1 + 1, c2).toInt();
-  long dur   = (c3 < 0 ? entry.substring(c2 + 1) : entry.substring(c2 + 1, c3)).toInt();
-  if (start >= 0 && dur > 0 && (uint32_t)(start + dur) > maxEnd)
-    maxEnd = start + dur;
+  id = entry.substring(0, c1);
+  long s = entry.substring(c1 + 1, c2).toInt();
+  long d = (c3 < 0 ? entry.substring(c2 + 1) : entry.substring(c2 + 1, c3)).toInt();
+  if (s < 0) s = 0;
+  if (d < 0) return false;
+  start = (uint32_t)s;
+  dur = (uint32_t)d;
+  return true;
+}
+
+// Invokes fn(id, start, dur) for every curve entry contained in a line.
+template <typename F>
+static void forEachCurveInLine(const String &line, F fn) {
+  if (line.startsWith("sC,")) {
+    String id; uint32_t s, d;
+    if (parseCurveEntry(line.substring(3), id, s, d)) fn(id, s, d);
+  } else if (line.startsWith("sSY,sC,")) {
+    String batch = line.substring(7);
+    int p = 0;
+    while (p < (int)batch.length()) {
+      int semi = batch.indexOf(';', p);
+      if (semi < 0) semi = batch.length();
+      String entry = batch.substring(p, semi);
+      p = semi + 1;
+      String id; uint32_t s, d;
+      if (entry.length() && parseCurveEntry(entry, id, s, d)) fn(id, s, d);
+    }
+  }
 }
 
 static uint32_t computeDurationMs(const String &commands) {
@@ -144,20 +199,9 @@ static uint32_t computeDurationMs(const String &commands) {
     line.trim();
     lineStart = lineEnd + 1;
     if (!line.length()) continue;
-
-    if (line.startsWith("sC,")) {
-      scanCurveFields(line.substring(3), maxEnd);
-    } else if (line.startsWith("sSY,sC,")) {
-      String batch = line.substring(7);
-      int p = 0;
-      while (p < (int)batch.length()) {
-        int semi = batch.indexOf(';', p);
-        if (semi < 0) semi = batch.length();
-        String entry = batch.substring(p, semi);
-        p = semi + 1;
-        if (entry.length()) scanCurveFields(entry, maxEnd);
-      }
-    }
+    forEachCurveInLine(line, [&](const String &, uint32_t s, uint32_t d) {
+      if (s + d > maxEnd) maxEnd = s + d;
+    });
   }
   return maxEnd;
 }
@@ -230,28 +274,79 @@ static bool saveProject() {
   return true;
 }
 
-// ── Command sending with flow control ─────────────────────────────────────────
+// ── Low-level command sending (flow control) ──────────────────────────────────
 
-static void sendCurrent() {
-  const QueuedCmd &qc = cmdQueue[qIndex];
-  wsLog(">> " + qc.cmd);
-  picoSerial.print(qc.cmd);
+static void sendLine(const String &cmd, const String &expect) {
+  wsLog(">> " + cmd);
+  picoSerial.print(cmd);
   picoSerial.print('\n');                    // the driver requires exactly '\n'
-  expectedPrefix = qc.expect;
+  expectedPrefix = expect;
   waitingReply = true;
   replyDeadline = millis() + REPLY_TIMEOUT_MS;
 }
 
-static void queueLines(const String &block, const char *expect) {
+// ── Streaming playback ────────────────────────────────────────────────────────
+//
+// Why streaming: the driver buffers at most DRIVER_CURVE_SLOTS (8) curves per
+// effector in a circular buffer — the 9th add overwrites the oldest one.
+// Dumping a long animation up-front would therefore destroy curves that have
+// not played yet. Instead we send each line shortly (STREAM_LOOKAHEAD_MS)
+// before its start time, and additionally hold a line back until the curve
+// it would overwrite in the driver's buffer has already finished.
+
+// True when every effector in the line can accept one more curve without
+// overwriting a still-pending one in the driver's circular buffer.
+static bool canSendItem(const StreamItem &item, uint32_t animTime) {
+  bool ok = true;
+  forEachCurveInLine(item.line, [&](const String &id, uint32_t, uint32_t) {
+    if (!ok) return;
+    const auto it = effectorLedger.find(id);
+    if (it == effectorLedger.end()) return;              // nothing sent yet
+    const std::vector<uint32_t> &ends = it->second;
+    if (ends.size() < DRIVER_CURVE_SLOTS) return;        // buffer not full
+    // Sending one more overwrites the (size - SLOTS + 1)-th oldest entry:
+    // it must have finished already.
+    uint32_t overwrittenEnd = ends[ends.size() - DRIVER_CURVE_SLOTS];
+    if (overwrittenEnd > animTime) ok = false;
+  });
+  return ok;
+}
+
+static void recordItemSent(const StreamItem &item) {
+  forEachCurveInLine(item.line, [&](const String &id, uint32_t s, uint32_t d) {
+    effectorLedger[id].push_back(s + d);
+  });
+}
+
+static void buildStream(const AnimEntry &anim) {
+  streamItems.clear();
+  streamIdx = 0;
+  effectorLedger.clear();
+
   int lineStart = 0;
-  while (lineStart < (int)block.length()) {
-    int lineEnd = block.indexOf('\n', lineStart);
-    if (lineEnd < 0) lineEnd = block.length();
-    String line = block.substring(lineStart, lineEnd);
+  while (lineStart < (int)anim.commands.length()) {
+    int lineEnd = anim.commands.indexOf('\n', lineStart);
+    if (lineEnd < 0) lineEnd = anim.commands.length();
+    String line = anim.commands.substring(lineStart, lineEnd);
     line.trim();
     lineStart = lineEnd + 1;
-    if (line.length()) cmdQueue.push_back({line, expect});
+    if (!line.length()) continue;
+
+    StreamItem item;
+    item.line = line;
+    item.startMs = UINT32_MAX;
+    forEachCurveInLine(line, [&](const String &, uint32_t s, uint32_t) {
+      if (s < item.startMs) item.startMs = s;
+    });
+    if (item.startMs == UINT32_MAX) item.startMs = 0;    // non-curve line
+    streamItems.push_back(item);
   }
+
+  // The export is chronological in practice; sort defensively anyway.
+  std::stable_sort(streamItems.begin(), streamItems.end(),
+                   [](const StreamItem &a, const StreamItem &b) {
+                     return a.startMs < b.startMs;
+                   });
 }
 
 static void startPlayback(size_t animIndex) {
@@ -262,23 +357,35 @@ static void startPlayback(size_t animIndex) {
 
   if (!setupDone) {
     cmdQueue.push_back({"hRQ,0", "btngoHSK"});
-    queueLines(setupCommands, "OK");
+    int lineStart = 0;
+    while (lineStart < (int)setupCommands.length()) {
+      int lineEnd = setupCommands.indexOf('\n', lineStart);
+      if (lineEnd < 0) lineEnd = setupCommands.length();
+      String line = setupCommands.substring(lineStart, lineEnd);
+      line.trim();
+      lineStart = lineEnd + 1;
+      if (line.length()) cmdQueue.push_back({line, "OK"});
+    }
   }
   cmdQueue.push_back({"tSYN,0", "OK"});
-  queueLines(animations[animIndex].commands, "OK");
 
-  pendingDurationMs = animations[animIndex].durationMs;
+  buildStream(animations[animIndex]);
+  animDurationMs = animations[animIndex].durationMs;
+
   playerState = SENDING;
   wsState("playing");
   wsLog("▶ " + animations[animIndex].name +
-        " (" + String(pendingDurationMs) + " ms)");
-  sendCurrent();
+        " (" + String(animDurationMs) + " ms, " +
+        String(streamItems.size()) + " lines)");
+  sendLine(cmdQueue[0].cmd, cmdQueue[0].expect);
 }
 
 static void stopPlayback() {
   playerState = IDLE;
   waitingReply = false;
   cmdQueue.clear();
+  streamItems.clear();
+  effectorLedger.clear();
   wsLog(">> xC");
   picoSerial.print("xC\n");   // clears curves WITHOUT resetting the Pico
   wsState("idle");
@@ -290,20 +397,25 @@ static void abortPlayback(const String &reason) {
   playerState = IDLE;
   waitingReply = false;
   cmdQueue.clear();
+  streamItems.clear();
+  effectorLedger.clear();
   wsState("idle");
 }
 
-static void advanceSequence() {
-  qIndex++;
-  if (qIndex < cmdQueue.size()) {
-    sendCurrent();
-    return;
+// Called whenever the expected reply arrived.
+static void onReplyReceived() {
+  if (playerState == SENDING) {
+    qIndex++;
+    if (qIndex < cmdQueue.size()) {
+      sendLine(cmdQueue[qIndex].cmd, cmdQueue[qIndex].expect);
+    } else {
+      // tSYN,0 acknowledged: the Pico's animation clock is now zero.
+      setupDone = true;
+      playerState = STREAMING;
+      animStartMs = millis();
+    }
   }
-  // Queue drained: mark setup as done; the Pico now plays on its own clock.
-  setupDone = true;
-  playerState = PLAYING;
-  playEndsAt = millis() + pendingDurationMs;
-  wsLog("Curves queued; the Pico plays on its own clock");
+  // In STREAMING the scheduler in pollPlayer() decides what to send next.
 }
 
 static void handlePicoLine(const String &line) {
@@ -311,7 +423,7 @@ static void handlePicoLine(const String &line) {
   if (!waitingReply) return;
   if (line.startsWith(expectedPrefix)) {
     waitingReply = false;
-    advanceSequence();
+    onReplyReceived();
   }
   // LOG,... and other lines are shown but do not consume the wait.
 }
@@ -335,8 +447,29 @@ static void pollPlayer() {
     abortPlayback("timeout waiting for \"" + expectedPrefix + "\"");
     return;
   }
-  if (playerState == PLAYING && millis() > playEndsAt) {
+
+  if (playerState != STREAMING || waitingReply) return;
+
+  uint32_t animTime = millis() - animStartMs;
+
+  // Feed the next line when its send window opened AND the driver's buffer
+  // for every effector it touches can take it.
+  if (streamIdx < streamItems.size()) {
+    const StreamItem &item = streamItems[streamIdx];
+    bool windowOpen = (animTime + STREAM_LOOKAHEAD_MS >= item.startMs);
+    if (windowOpen && canSendItem(item, animTime)) {
+      recordItemSent(item);
+      sendLine(item.line, "OK");
+      streamIdx++;
+    }
+    return;
+  }
+
+  // Everything sent: wait for the animation to actually finish.
+  if (animTime > animDurationMs) {
     playerState = IDLE;
+    streamItems.clear();
+    effectorLedger.clear();
     wsState("idle");
     wsLog("Animation finished");
   }
