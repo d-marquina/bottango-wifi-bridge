@@ -203,7 +203,9 @@
         info.className = 'anim-info';
         info.innerHTML = '<div class="anim-name"></div><div class="anim-time"></div>';
         info.querySelector('.anim-name').textContent = anims[idx].name;
-        info.querySelector('.anim-time').textContent = (anims[idx].ms / 1000).toFixed(1) + ' s';
+        info.querySelector('.anim-time').textContent =
+          (anims[idx].ms / 1000).toFixed(1) + ' s' +
+          (anims[idx].file ? ' · ' + anims[idx].file : '');
 
         var actions = document.createElement('div');
         actions.className = 'anim-actions';

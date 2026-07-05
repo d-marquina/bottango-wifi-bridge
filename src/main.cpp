@@ -10,14 +10,20 @@
  *
  * Features:
  *   - Own Access Point (no captive portal: browse to http://192.168.4.1).
- *   - Upload the AnimationCommands.json exported by Bottango FROM the web
- *     page; it is persisted in LittleFS (/project.json) — upload once.
- *   - Dynamic animation list (name + computed duration).
- *   - Rename / delete animations from the web page (changes are persisted).
+ *   - Multi-file animation library: every AnimationCommands.json exported
+ *     by Bottango is stored as its OWN file under /anims/ in LittleFS.
+ *     Each file keeps its own effector setup, so different animations may
+ *     use different servo configurations. Re-uploading a file with the
+ *     same name replaces it.
+ *   - Automatic effector re-registration: when the selected animation
+ *     belongs to a file whose setup differs from the one currently
+ *     registered on the Pico, the bridge re-runs handshake + setup first.
+ *   - Dynamic animation list (name + duration + source file).
+ *   - Rename / delete animations (persisted into their source file; a
+ *     file whose last animation is deleted is removed).
  *   - STREAMING playback (no curve-count limit): curves are sent just
- *     ahead of their start time instead of all up-front, respecting the
- *     driver's 8-slot circular curve buffer per effector. Flow control is
- *     honoured throughout (wait for OK after each command).
+ *     ahead of their start time, respecting the driver's 8-slot circular
+ *     curve buffer per effector. Flow control honoured throughout.
  *   - Stop via xC (STOP would trigger machine.reset() on the Pico).
  */
 
@@ -40,12 +46,11 @@ static const int UART_TX_PIN = 17;  // → Pico GP1 (RX)
 static const int UART_RX_PIN = 16;  // ← Pico GP0 (TX)
 static const uint32_t UART_BAUD = 115200;
 
-static const char *PROJECT_FILE = "/project.json";
+static const char *ANIMS_DIR = "/anims";
+static const char *LEGACY_PROJECT_FILE = "/project.json";   // pre-library layout
 static const uint32_t REPLY_TIMEOUT_MS = 3000;
 
-// Streaming: send each curve this many ms before its start time. Large
-// enough to survive WiFi/UART hiccups, small enough to keep few curves
-// in flight per effector.
+// Streaming: send each curve this many ms before its start time.
 static const uint32_t STREAM_LOOKAHEAD_MS = 1000;
 
 // The driver's per-effector circular curve buffer size (MAX_NUM_CURVES in
@@ -55,17 +60,23 @@ static const size_t DRIVER_CURVE_SLOTS = 8;
 
 HardwareSerial picoSerial(2);
 
-// ── Loaded project (parsed from /project.json) ───────────────────────────────
+// ── Animation library (one ProjectFile per uploaded JSON) ────────────────────
+
+struct ProjectFile {
+  String path;         // e.g. /anims/00AnimationCommands.json
+  String controller;   // "Controller Name" field
+  String setup;        // effector registration lines, '\n'-separated
+};
 
 struct AnimEntry {
+  int fileIdx;          // index into `files`
   String name;
   String commands;      // playback lines (sSY / sC) separated by '\n'
-  String loopCommands;  // loop lines (kept so rewriting the file is lossless)
+  String loopCommands;  // kept so rewriting the file is lossless
   uint32_t durationMs;
 };
 
-static String controllerName;
-static String setupCommands;              // rSVI2C/rSVPin/... lines, '\n'-separated
+static std::vector<ProjectFile> files;
 static std::vector<AnimEntry> animations;
 
 // ── Player state ──────────────────────────────────────────────────────────────
@@ -95,13 +106,17 @@ static size_t streamIdx = 0;
 static uint32_t animStartMs = 0;        // millis() when tSYN,0 was acknowledged
 static uint32_t animDurationMs = 0;
 // Per-effector ledger of END times of every curve already sent, in send
-// order. Used to respect the driver's 8-slot buffer (see canSendToEffector).
+// order. Used to respect the driver's 8-slot buffer (see canSendItem).
 static std::map<String, std::vector<uint32_t>> effectorLedger;
 
 static bool waitingReply = false;
 static String expectedPrefix;
 static uint32_t replyDeadline = 0;
-static bool setupDone = false;    // handshake + setup already sent this session
+
+// Setup currently registered on the Pico ("" = none). When the next
+// animation's file declares a different setup, the bridge re-registers.
+static String registeredSetup;
+static String pendingSetup;    // becomes registeredSetup once SENDING finishes
 
 static String uartLineBuffer;
 
@@ -134,13 +149,20 @@ static void wsState(const char *state) {
   ws.textAll(String("{\"type\":\"state\",\"state\":\"") + state + "\"}");
 }
 
+static String fileBasename(const String &path) {
+  int slash = path.lastIndexOf('/');
+  return (slash >= 0) ? path.substring(slash + 1) : path;
+}
+
 static String buildAnimListJson() {
+  String controller = files.empty() ? "" : files[0].controller;
   String out = "{\"type\":\"anims\",\"controller\":\"" +
-               jsonEscape(controllerName) + "\",\"list\":[";
+               jsonEscape(controller) + "\",\"list\":[";
   for (size_t i = 0; i < animations.size(); i++) {
     if (i) out += ',';
     out += "{\"name\":\"" + jsonEscape(animations[i].name) + "\",\"ms\":" +
-           String(animations[i].durationMs) + "}";
+           String(animations[i].durationMs) + ",\"file\":\"" +
+           jsonEscape(fileBasename(files[animations[i].fileIdx].path)) + "\"}";
   }
   out += "]}";
   return out;
@@ -150,8 +172,6 @@ static String buildAnimListJson() {
 // sC entry fields (after the "sC," prefix): id,start,dur,startY,cp1x,cp1y,...
 // sSY batches several entries separated by ';' after the "sSY,sC," prefix.
 
-// Extracts id / start / duration from one curve entry. Returns false if the
-// entry is malformed (e.g. the trailing hash fragment of an sSY batch).
 static bool parseCurveEntry(const String &entry, String &id,
                             uint32_t &start, uint32_t &dur) {
   int c1 = entry.indexOf(',');
@@ -206,67 +226,103 @@ static uint32_t computeDurationMs(const String &commands) {
   return maxEnd;
 }
 
-// ── Project load / save (LittleFS) ────────────────────────────────────────────
+// ── Library load / save (LittleFS, one file per uploaded JSON) ───────────────
 
-static bool loadProject() {
-  controllerName = "";
-  setupCommands = "";
-  animations.clear();
-
-  File f = LittleFS.open(PROJECT_FILE, "r");
+static bool loadOneFile(const String &path) {
+  File f = LittleFS.open(path, "r");
   if (!f) return false;
 
   JsonDocument doc;   // ArduinoJson 7: elastic capacity
   DeserializationError err = deserializeJson(doc, f);
   f.close();
   if (err) {
-    wsLog(String("ERROR: invalid JSON: ") + err.c_str());
+    wsLog("ERROR: invalid JSON in " + fileBasename(path) + ": " + err.c_str());
     return false;
   }
 
   JsonArray controllers = doc.as<JsonArray>();
-  if (controllers.isNull() || controllers.size() == 0) {
-    wsLog("ERROR: JSON contains no controllers");
-    return false;
-  }
-
+  if (controllers.isNull() || controllers.size() == 0) return false;
   JsonObject first = controllers[0];
-  controllerName = (const char *)(first["Controller Name"] | "");
-  setupCommands  = (const char *)(first["Setup"]["Controller Setup Commands"] | "");
+
+  ProjectFile pf;
+  pf.path       = path;
+  pf.controller = (const char *)(first["Controller Name"] | "");
+  pf.setup      = (const char *)(first["Setup"]["Controller Setup Commands"] | "");
+  files.push_back(pf);
+  int fileIdx = files.size() - 1;
 
   for (JsonObject a : first["Animations"].as<JsonArray>()) {
     AnimEntry e;
+    e.fileIdx      = fileIdx;
     e.name         = (const char *)(a["Animation Name"] | "Unnamed");
     e.commands     = (const char *)(a["Animation Commands"] | "");
     e.loopCommands = (const char *)(a["Animation Loop Commands"] | "");
     e.durationMs   = computeDurationMs(e.commands);
     animations.push_back(e);
   }
-
-  Serial.printf("Project: %s (%u animations)\n",
-                controllerName.c_str(), animations.size());
   return true;
 }
 
-// Rewrites /project.json from the in-memory state (after rename/delete),
-// preserving the exact Bottango export schema so it stays re-loadable.
-static bool saveProject() {
+static void loadLibrary() {
+  files.clear();
+  animations.clear();
+
+  if (!LittleFS.exists(ANIMS_DIR)) LittleFS.mkdir(ANIMS_DIR);
+
+  // One-time migration from the previous single-file layout.
+  if (LittleFS.exists(LEGACY_PROJECT_FILE)) {
+    LittleFS.rename(LEGACY_PROJECT_FILE, String(ANIMS_DIR) + "/library.json");
+    Serial.println("Migrated legacy project.json into /anims/library.json");
+  }
+
+  File dir = LittleFS.open(ANIMS_DIR);
+  if (!dir) return;
+  File f = dir.openNextFile();
+  std::vector<String> paths;
+  while (f) {
+    String p = String("/") + f.path();
+    p.replace("//", "/");
+    if (!f.isDirectory() && p.endsWith(".json")) paths.push_back(p);
+    f = dir.openNextFile();
+  }
+  std::sort(paths.begin(), paths.end());   // stable, predictable list order
+  for (const String &p : paths) loadOneFile(p);
+
+  Serial.printf("Library: %u files, %u animations\n",
+                files.size(), animations.size());
+}
+
+// Rewrites one library file from the in-memory state (after rename/delete),
+// preserving the Bottango export schema. Removes the file if it has no
+// animations left. Returns true on success.
+static bool saveFile(int fileIdx) {
+  std::vector<const AnimEntry *> mine;
+  for (const AnimEntry &e : animations)
+    if (e.fileIdx == fileIdx) mine.push_back(&e);
+
+  const ProjectFile &pf = files[fileIdx];
+
+  if (mine.empty()) {
+    LittleFS.remove(pf.path);
+    return true;
+  }
+
   JsonDocument doc;
   JsonArray controllers = doc.to<JsonArray>();
   JsonObject c = controllers.add<JsonObject>();
-  c["Controller Name"] = controllerName;
-  c["Setup"]["Controller Setup Commands"] = setupCommands;
+  c["Controller Name"] = pf.controller;
+  c["Setup"]["Controller Setup Commands"] = pf.setup;
   JsonArray arr = c["Animations"].to<JsonArray>();
-  for (const AnimEntry &e : animations) {
+  for (const AnimEntry *e : mine) {
     JsonObject a = arr.add<JsonObject>();
-    a["Animation Name"] = e.name;
-    a["Animation Commands"] = e.commands;
-    a["Animation Loop Commands"] = e.loopCommands;
+    a["Animation Name"] = e->name;
+    a["Animation Commands"] = e->commands;
+    a["Animation Loop Commands"] = e->loopCommands;
   }
 
-  File f = LittleFS.open(PROJECT_FILE, "w");
+  File f = LittleFS.open(pf.path, "w");
   if (!f) {
-    wsLog("ERROR: could not write project file");
+    wsLog("ERROR: could not write " + fileBasename(pf.path));
     return false;
   }
   serializeJson(doc, f);
@@ -286,16 +342,10 @@ static void sendLine(const String &cmd, const String &expect) {
 }
 
 // ── Streaming playback ────────────────────────────────────────────────────────
-//
-// Why streaming: the driver buffers at most DRIVER_CURVE_SLOTS (8) curves per
-// effector in a circular buffer — the 9th add overwrites the oldest one.
-// Dumping a long animation up-front would therefore destroy curves that have
-// not played yet. Instead we send each line shortly (STREAM_LOOKAHEAD_MS)
-// before its start time, and additionally hold a line back until the curve
-// it would overwrite in the driver's buffer has already finished.
+// See README: curves are sent ~STREAM_LOOKAHEAD_MS before their start time,
+// and a line is held back while it would overwrite a still-pending curve in
+// the driver's 8-slot circular buffer (per effector).
 
-// True when every effector in the line can accept one more curve without
-// overwriting a still-pending one in the driver's circular buffer.
 static bool canSendItem(const StreamItem &item, uint32_t animTime) {
   bool ok = true;
   forEachCurveInLine(item.line, [&](const String &id, uint32_t, uint32_t) {
@@ -304,8 +354,6 @@ static bool canSendItem(const StreamItem &item, uint32_t animTime) {
     if (it == effectorLedger.end()) return;              // nothing sent yet
     const std::vector<uint32_t> &ends = it->second;
     if (ends.size() < DRIVER_CURVE_SLOTS) return;        // buffer not full
-    // Sending one more overwrites the (size - SLOTS + 1)-th oldest entry:
-    // it must have finished already.
     uint32_t overwrittenEnd = ends[ends.size() - DRIVER_CURVE_SLOTS];
     if (overwrittenEnd > animTime) ok = false;
   });
@@ -342,7 +390,6 @@ static void buildStream(const AnimEntry &anim) {
     streamItems.push_back(item);
   }
 
-  // The export is chronological in practice; sort defensively anyway.
   std::stable_sort(streamItems.begin(), streamItems.end(),
                    [](const StreamItem &a, const StreamItem &b) {
                      return a.startMs < b.startMs;
@@ -352,30 +399,38 @@ static void buildStream(const AnimEntry &anim) {
 static void startPlayback(size_t animIndex) {
   if (playerState != IDLE || animIndex >= animations.size()) return;
 
+  const AnimEntry &anim = animations[animIndex];
+  const String &setup = files[anim.fileIdx].setup;
+
   cmdQueue.clear();
   qIndex = 0;
 
-  if (!setupDone) {
+  // Re-register effectors whenever this animation's file declares a setup
+  // different from the one currently active on the Pico. hRQ clears the
+  // Pico's effector pool, so the new setup starts from a clean slate.
+  if (registeredSetup != setup) {
     cmdQueue.push_back({"hRQ,0", "btngoHSK"});
     int lineStart = 0;
-    while (lineStart < (int)setupCommands.length()) {
-      int lineEnd = setupCommands.indexOf('\n', lineStart);
-      if (lineEnd < 0) lineEnd = setupCommands.length();
-      String line = setupCommands.substring(lineStart, lineEnd);
+    while (lineStart < (int)setup.length()) {
+      int lineEnd = setup.indexOf('\n', lineStart);
+      if (lineEnd < 0) lineEnd = setup.length();
+      String line = setup.substring(lineStart, lineEnd);
       line.trim();
       lineStart = lineEnd + 1;
       if (line.length()) cmdQueue.push_back({line, "OK"});
     }
+    pendingSetup = setup;
+  } else {
+    pendingSetup = registeredSetup;
   }
   cmdQueue.push_back({"tSYN,0", "OK"});
 
-  buildStream(animations[animIndex]);
-  animDurationMs = animations[animIndex].durationMs;
+  buildStream(anim);
+  animDurationMs = anim.durationMs;
 
   playerState = SENDING;
   wsState("playing");
-  wsLog("▶ " + animations[animIndex].name +
-        " (" + String(animDurationMs) + " ms, " +
+  wsLog("▶ " + anim.name + " (" + String(animDurationMs) + " ms, " +
         String(streamItems.size()) + " lines)");
   sendLine(cmdQueue[0].cmd, cmdQueue[0].expect);
 }
@@ -399,6 +454,7 @@ static void abortPlayback(const String &reason) {
   cmdQueue.clear();
   streamItems.clear();
   effectorLedger.clear();
+  registeredSetup = "";   // setup state on the Pico is now uncertain
   wsState("idle");
 }
 
@@ -410,7 +466,7 @@ static void onReplyReceived() {
       sendLine(cmdQueue[qIndex].cmd, cmdQueue[qIndex].expect);
     } else {
       // tSYN,0 acknowledged: the Pico's animation clock is now zero.
-      setupDone = true;
+      registeredSetup = pendingSetup;
       playerState = STREAMING;
       animStartMs = millis();
     }
@@ -452,8 +508,6 @@ static void pollPlayer() {
 
   uint32_t animTime = millis() - animStartMs;
 
-  // Feed the next line when its send window opened AND the driver's buffer
-  // for every effector it touches can take it.
   if (streamIdx < streamItems.size()) {
     const StreamItem &item = streamItems[streamIdx];
     bool windowOpen = (animTime + STREAM_LOOKAHEAD_MS >= item.startMs);
@@ -465,7 +519,6 @@ static void pollPlayer() {
     return;
   }
 
-  // Everything sent: wait for the animation to actually finish.
   if (animTime > animDurationMs) {
     playerState = IDLE;
     streamItems.clear();
@@ -480,7 +533,7 @@ static void pollPlayer() {
 static void renameAnimation(size_t idx, const String &newName) {
   if (idx >= animations.size() || !newName.length()) return;
   animations[idx].name = newName;
-  if (saveProject()) {
+  if (saveFile(animations[idx].fileIdx)) {
     ws.textAll(buildAnimListJson());
     wsLog("Renamed to: " + newName);
   }
@@ -493,8 +546,10 @@ static void deleteAnimation(size_t idx) {
     return;
   }
   String gone = animations[idx].name;
+  int fileIdx = animations[idx].fileIdx;
   animations.erase(animations.begin() + idx);
-  if (saveProject()) {
+  if (saveFile(fileIdx)) {
+    loadLibrary();               // re-index (the file may have been removed)
     ws.textAll(buildAnimListJson());
     wsLog("Deleted: " + gone);
   }
@@ -533,22 +588,36 @@ static void onWsEvent(AsyncWebSocket *serverPtr, AsyncWebSocketClient *client,
 }
 
 // ── Project upload (POST /upload) ─────────────────────────────────────────────
+// Each uploaded JSON becomes its own file under /anims/, keyed by its
+// original filename (sanitized). Re-uploading the same filename replaces it.
+
+static String sanitizeFilename(const String &raw) {
+  String base = fileBasename(raw);
+  String out;
+  for (size_t i = 0; i < base.length(); i++) {
+    char c = base[i];
+    if (isalnum((int)c) || c == '.' || c == '_' || c == '-') out += c;
+    else out += '_';
+  }
+  if (!out.length()) out = "upload.json";
+  if (!out.endsWith(".json")) out += ".json";
+  return String(ANIMS_DIR) + "/" + out;
+}
 
 static void handleUploadChunk(AsyncWebServerRequest *req, String filename,
                               size_t index, uint8_t *data, size_t len, bool final) {
   static File uploadFile;
   if (index == 0) {
-    uploadFile = LittleFS.open(PROJECT_FILE, "w");
+    uploadFile = LittleFS.open(sanitizeFilename(filename), "w");
   }
   if (uploadFile) uploadFile.write(data, len);
   if (final && uploadFile) {
     uploadFile.close();
-    if (loadProject()) {
-      setupDone = false;          // effectors may have changed → re-register
-      ws.textAll(buildAnimListJson());
-      wsLog("Project updated: " + controllerName + " (" +
-            String(animations.size()) + " animations)");
-    }
+    loadLibrary();
+    registeredSetup = "";        // force re-registration on next play
+    ws.textAll(buildAnimListJson());
+    wsLog("Library updated: " + String(files.size()) + " files, " +
+          String(animations.size()) + " animations");
   }
 }
 
@@ -562,7 +631,7 @@ void setup() {
     Serial.println("LittleFS: mount failed");
   }
 
-  loadProject();   // if a persisted project.json exists, it is ready to go
+  loadLibrary();   // load every persisted /anims/*.json
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);

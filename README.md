@@ -20,12 +20,19 @@ Browser ──WiFi/WebSocket──► ESP32 ──UART2──► RPi Pico ──
 
 - **Self-contained Access Point** — the ESP32 creates its own WiFi network;
   browse to `http://192.168.4.1`. Works anywhere, no router needed.
-- **Upload once, play forever** — upload the `AnimationCommands.json`
-  exported by Bottango from the web page itself; it persists in the ESP32
-  flash (LittleFS) across reboots.
-- **Animation list with computed durations**, play/stop per animation.
+- **Multi-file animation library** — every `AnimationCommands.json`
+  exported by Bottango is stored as its own file under `/anims/` in the
+  ESP32 flash (LittleFS), persisting across reboots. Each file keeps its
+  own effector setup, so different animations may use different servo
+  configurations. Re-uploading a file with the same name replaces it.
+- **Automatic effector re-registration** — when the selected animation
+  belongs to a file whose setup differs from the one currently registered
+  on the Pico, the bridge re-runs handshake + setup transparently.
+- **Animation list with computed durations and source file**, play/stop
+  per animation.
 - **Rename / delete animations** from the web page (changes are persisted
-  back to the stored project file).
+  into their source file; a file whose last animation is deleted is
+  removed).
 - **Faithful Bottango host protocol** — handshake (`hRQ`/`btngoHSK`),
   effector registration, `tSYN` time sync and curve delivery (`sSY`/`sC`)
   with per-command OK flow control. Stop uses `xC` (never `STOP`, which
@@ -103,10 +110,11 @@ Close the serial monitor before uploading (it holds the COM port).
 
 1. Power the system; the ESP32 starts the `Animatronico` WiFi network.
 2. Connect your device to it and browse to `http://192.168.4.1`.
-3. First time only: tap **⬆ Subir proyecto (JSON)** and pick the
-   `AnimationCommands.json` exported by Bottango
-   (*export → "Data as json"*).
-4. Tap **▶** on any animation. **■ Detener** stops playback.
+3. Tap **⬆ Subir proyecto (JSON)** and pick an `AnimationCommands.json`
+   exported by Bottango (*export → "Data as json"*). Repeat for as many
+   exports as you like — each becomes a separate library file (rename the
+   files on your device first if they share the same name).
+4. Tap **▶** on any animation. **■ Detener / Stop** stops playback.
 
 Tip: generate a WiFi QR code (`WIFI:T:WPA;S:Animatronico;P:bottango123;;`)
 and stick it on the animatronic — scanning it joins the network directly.
